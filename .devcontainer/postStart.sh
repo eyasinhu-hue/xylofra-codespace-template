@@ -6,6 +6,9 @@ RUNNER_LOG="/tmp/xylofra-runner.log"
 TUNNEL_LOG="/tmp/xylofra-tunnel.log"
 URL_FILE="/tmp/xylofra-public-url.txt"
 
+# Auto-update repo on each start so future postStart changes apply without recreating
+(cd "$REPO_ROOT" && git fetch --quiet origin main && git reset --hard origin/main >/dev/null 2>&1) || true
+
 # Source repo-stored runner.env if present
 if [ -f "$REPO_ROOT/.devcontainer/runner.env" ]; then
   set -a; . "$REPO_ROOT/.devcontainer/runner.env"; set +a
