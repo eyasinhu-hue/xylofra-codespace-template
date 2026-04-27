@@ -65,16 +65,35 @@ fi
 
 mkdir -p /workspaces/workspace
 
-# 1) Start the runner if not running
-if ! pgrep -f "node.*runner/server.js" > /dev/null 2>&1; then
-  diag "starting runner on :${RUNNER_PORT:-3939}"
+# 1) Ensure pm2 (process supervisor) is installed
+if ! command -v pm2 > /dev/null 2>&1; then
+  diag "installing pm2 globally..."
+  npm install -g pm2 > /tmp/pm2-install.log 2>&1 \
+    && diag "pm2 installed: $(pm2 --version 2>/dev/null)" \
+    || diag "pm2 install FAILED ($(tail -n 3 /tmp/pm2-install.log | tr '\n' '|'))"
+fi
+
+# 2) Start the runner under pm2 (idempotent — restarts cleanly each call)
+if command -v pm2 > /dev/null 2>&1; then
+  pm2 delete xylofra-runner > /dev/null 2>&1 || true
   RUNNER_SECRET="$SECRET_VAL" \
   WORKSPACE_DIR="/workspaces/workspace" \
   PORT="${RUNNER_PORT:-3939}" \
-  nohup node "$RUNNER_DIR/server.js" > "$RUNNER_LOG" 2>&1 &
-  disown
+  pm2 start "$RUNNER_DIR/server.js" \
+    --name xylofra-runner --time --update-env --max-memory-restart 1G \
+    > /tmp/pm2-start.log 2>&1 \
+    && diag "runner started under pm2" \
+    || diag "pm2 start FAILED ($(tail -n 3 /tmp/pm2-start.log | tr '\n' '|'))"
+  pm2 save --force > /dev/null 2>&1 || true
 else
-  diag "runner already running"
+  # Fallback: nohup (won't survive SSH sessions)
+  diag "WARN: pm2 unavailable, falling back to nohup"
+  pkill -f "node.*runner/server.js" 2>/dev/null || true
+  RUNNER_SECRET="$SECRET_VAL" \
+  WORKSPACE_DIR="/workspaces/workspace" \
+  PORT="${RUNNER_PORT:-3939}" \
+  nohup setsid node "$RUNNER_DIR/server.js" > "$RUNNER_LOG" 2>&1 < /dev/null &
+  disown
 fi
 
 # 2) Wait for runner local health
