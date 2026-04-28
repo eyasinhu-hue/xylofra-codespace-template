@@ -186,14 +186,127 @@ app.post("/file/search", async (req, res) => {
   res.json({ matches: result.stdout.trim() || "(no matches)" });
 });
 
-app.post("/preview", async (req, res) => {
-  const { port } = req.body || {};
-  const p = parseInt(port || "3000", 10);
-  if (!CODESPACE_NAME) {
-    return res.json({ url: `http://localhost:${p}`, note: "Not in Codespace" });
+// --- Per-port public preview tunnels (cloudflared quick tunnels under pm2) --
+// Each user-app port (3000, 5173, 8000, ...) gets its OWN public cloudflared
+// quick tunnel so the preview is reachable WITHOUT GitHub auth. Tunnels are
+// pm2-supervised so they survive the runner crashing.
+const PREVIEW_LOG_DIR = "/tmp";
+const previewLog = (p) => `${PREVIEW_LOG_DIR}/xylofra-preview-${p}.log`;
+const previewUrlFile = (p) => `${PREVIEW_LOG_DIR}/xylofra-preview-${p}.url`;
+const previewName = (p) => `xylofra-preview-${p}`;
+
+function execCmd(cmd, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    exec(cmd, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+      resolve({ ok: !err, stdout: String(stdout || ""), stderr: String(stderr || ""), err });
+    });
+  });
+}
+
+async function readPreviewUrl(p, timeoutMs = 25000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const buf = await fsp.readFile(previewLog(p), "utf8");
+      const m = buf.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+      if (m) return m[0];
+    } catch (_) { /* log not created yet */ }
+    await new Promise((r) => setTimeout(r, 500));
   }
-  const url = `https://${CODESPACE_NAME}-${p}.${PORT_FORWARD_DOMAIN}`;
-  res.json({ url, port: p, codespace: CODESPACE_NAME });
+  return null;
+}
+
+app.post("/preview", async (req, res) => {
+  const { port, force } = req.body || {};
+  const p = parseInt(port || "3000", 10);
+  if (!Number.isInteger(p) || p < 1 || p > 65535) {
+    return res.status(400).json({ error: "invalid port" });
+  }
+
+  // 1) Cached URL? Try the file written by a prior /preview call.
+  if (!force) {
+    try {
+      const cached = (await fsp.readFile(previewUrlFile(p), "utf8")).trim();
+      if (cached.startsWith("https://")) {
+        // Verify pm2 tunnel still alive
+        const list = await execCmd(`pm2 jlist`, 8000);
+        let alive = false;
+        try {
+          const arr = JSON.parse(list.stdout || "[]");
+          alive = arr.some((x) => x.name === previewName(p) && x.pm2_env?.status === "online");
+        } catch (_) {}
+        if (alive) return res.json({ url: cached, port: p, cached: true });
+      }
+    } catch (_) { /* no cache */ }
+  }
+
+  // 2) Find cloudflared binary
+  const which = await execCmd(`command -v cloudflared || echo ""`, 4000);
+  const cfdBin = which.stdout.trim();
+  if (!cfdBin) {
+    // Fallback: GitHub auth-protected URL (only works in browser w/ auth)
+    if (CODESPACE_NAME) {
+      const url = `https://${CODESPACE_NAME}-${p}.${PORT_FORWARD_DOMAIN}`;
+      return res.json({ url, port: p, fallback: "github-port-forward", note: "cloudflared missing" });
+    }
+    return res.status(500).json({ error: "cloudflared not installed and not in Codespace" });
+  }
+
+  // 3) Spawn cloudflared under pm2 (idempotent — delete then start)
+  await execCmd(`pm2 delete ${previewName(p)} 2>/dev/null`, 4000);
+  // Wipe the old log so we don't read a stale URL
+  try { await fsp.writeFile(previewLog(p), ""); } catch (_) {}
+  const startCmd =
+    `pm2 start "${cfdBin}" --name ${previewName(p)} --time --restart-delay 3000 ` +
+    `--output "${previewLog(p)}" --error "${previewLog(p)}" ` +
+    `-- tunnel --no-autoupdate --url http://localhost:${p}`;
+  const started = await execCmd(startCmd, 10000);
+  if (!started.ok) {
+    return res.status(500).json({
+      error: "failed to start preview tunnel",
+      detail: (started.stderr || started.stdout).slice(0, 500),
+    });
+  }
+  await execCmd(`pm2 save --force 2>/dev/null`, 4000);
+
+  // 4) Poll log for trycloudflare URL
+  const url = await readPreviewUrl(p, 30000);
+  if (!url) {
+    let tail = "";
+    try { tail = (await fsp.readFile(previewLog(p), "utf8")).slice(-600); } catch (_) {}
+    return res.status(504).json({
+      error: "tunnel started but URL not found in log",
+      log_tail: tail,
+    });
+  }
+  try { await fsp.writeFile(previewUrlFile(p), url); } catch (_) {}
+  res.json({ url, port: p, cached: false });
+});
+
+app.post("/preview/stop", async (req, res) => {
+  const { port } = req.body || {};
+  const p = parseInt(port, 10);
+  if (!Number.isInteger(p)) return res.status(400).json({ error: "invalid port" });
+  await execCmd(`pm2 delete ${previewName(p)} 2>/dev/null`, 5000);
+  try { await fsp.unlink(previewUrlFile(p)); } catch (_) {}
+  res.json({ ok: true, port: p });
+});
+
+app.get("/preview/list", async (_req, res) => {
+  const list = await execCmd(`pm2 jlist`, 8000);
+  let entries = [];
+  try {
+    const arr = JSON.parse(list.stdout || "[]");
+    for (const x of arr) {
+      const m = (x.name || "").match(/^xylofra-preview-(\d+)$/);
+      if (!m) continue;
+      const p = parseInt(m[1], 10);
+      let url = null;
+      try { url = (await fsp.readFile(previewUrlFile(p), "utf8")).trim() || null; } catch (_) {}
+      entries.push({ port: p, status: x.pm2_env?.status || "unknown", url });
+    }
+  } catch (_) {}
+  res.json({ entries });
 });
 
 // Streaming snapshot of all text files (used by edge function syncAll)
