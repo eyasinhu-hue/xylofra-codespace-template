@@ -124,12 +124,27 @@ if ! command -v cloudflared > /dev/null 2>&1; then
   fi
 fi
 
-# 4) Start cloudflared quick tunnel
-if ! pgrep -f "cloudflared.*tunnel" > /dev/null 2>&1; then
-  : > "$TUNNEL_LOG"
-  diag "starting cloudflared tunnel -> http://localhost:${RUNNER_PORT:-3939}"
-  nohup cloudflared tunnel --no-autoupdate --url "http://localhost:${RUNNER_PORT:-3939}" \
-    > "$TUNNEL_LOG" 2>&1 &
+# 4) Start cloudflared quick tunnel under pm2 (so it survives SSH session end
+#    and auto-restarts on crash)
+CFD_BIN="$(command -v cloudflared || echo /usr/local/bin/cloudflared)"
+: > "$TUNNEL_LOG"
+
+if command -v pm2 > /dev/null 2>&1 && [ -x "$CFD_BIN" ]; then
+  pm2 delete xylofra-tunnel > /dev/null 2>&1 || true
+  diag "starting cloudflared under pm2 -> http://localhost:${RUNNER_PORT:-3939}"
+  pm2 start "$CFD_BIN" \
+    --name xylofra-tunnel --time --restart-delay 3000 \
+    --output "$TUNNEL_LOG" --error "$TUNNEL_LOG" \
+    -- tunnel --no-autoupdate --url "http://localhost:${RUNNER_PORT:-3939}" \
+    > /tmp/pm2-tunnel.log 2>&1 \
+    && diag "tunnel started under pm2" \
+    || diag "pm2 tunnel start FAILED ($(tail -n 3 /tmp/pm2-tunnel.log | tr '\n' '|'))"
+  pm2 save --force > /dev/null 2>&1 || true
+else
+  pkill -f "cloudflared.*tunnel" 2>/dev/null || true
+  diag "WARN: pm2 unavailable, falling back to nohup for cloudflared"
+  nohup setsid cloudflared tunnel --no-autoupdate --url "http://localhost:${RUNNER_PORT:-3939}" \
+    > "$TUNNEL_LOG" 2>&1 < /dev/null &
   disown
 fi
 
@@ -148,18 +163,84 @@ fi
 
 echo -n "$PUBLIC_URL" > "$URL_FILE"
 
-# 6) Self-register with Supabase
-if [ -n "${SUPABASE_URL_PUBLIC:-}" ] && [ -n "${SUPABASE_ANON_KEY:-}" ]; then
-  REG_BODY="{\"p_secret\":\"$SECRET_VAL\",\"p_url\":\"$PUBLIC_URL\"}"
-  REG_RESP=$(curl -sS -X POST \
+# 6) Helper: register URL with Supabase (used by initial registration AND watcher)
+register_url() {
+  local URL="$1"
+  if [ -z "${SUPABASE_URL_PUBLIC:-}" ] || [ -z "${SUPABASE_ANON_KEY:-}" ]; then
+    return 1
+  fi
+  curl -sS -m 10 -X POST \
     -H "apikey: ${SUPABASE_ANON_KEY}" \
     -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
     -H "Content-Type: application/json" \
-    -d "$REG_BODY" \
-    "${SUPABASE_URL_PUBLIC}/rest/v1/rpc/register_runner_url" 2>&1)
-  diag "register_runner_url resp: $REG_RESP"
-else
-  diag "WARN: Supabase env vars not set; URL not auto-registered."
+    -d "{\"p_secret\":\"$SECRET_VAL\",\"p_url\":\"$URL\"}" \
+    "${SUPABASE_URL_PUBLIC}/rest/v1/rpc/register_runner_url"
+}
+
+# 6a) Initial registration
+REG_RESP=$(register_url "$PUBLIC_URL" 2>&1)
+diag "register_runner_url resp: $REG_RESP"
+
+# 7) URL watcher under pm2: detects when cloudflared crashes/restarts and gets
+#    a new *.trycloudflare.com URL, then re-registers it with Supabase. Also
+#    fires a heartbeat re-registration every 5 minutes to keep
+#    runner_last_seen fresh.
+WATCHER_SCRIPT="$HOME/.xylofra-url-watcher.sh"
+cat > "$WATCHER_SCRIPT" <<WATCHER_EOF
+#!/usr/bin/env bash
+TUNNEL_LOG="$TUNNEL_LOG"
+URL_FILE="$URL_FILE"
+SECRET_VAL="$SECRET_VAL"
+SUPABASE_URL_PUBLIC="${SUPABASE_URL_PUBLIC:-}"
+SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY:-}"
+
+last_url=""
+[ -s "\$URL_FILE" ] && last_url="\$(cat "\$URL_FILE")"
+heartbeat=0
+while true; do
+  current="\$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "\$TUNNEL_LOG" 2>/dev/null | tail -n1)"
+  if [ -n "\$current" ] && [ "\$current" != "\$last_url" ]; then
+    echo "[watcher] URL changed: \$last_url -> \$current"
+    echo -n "\$current" > "\$URL_FILE"
+    last_url="\$current"
+    heartbeat=0
+    if [ -n "\$SUPABASE_URL_PUBLIC" ] && [ -n "\$SUPABASE_ANON_KEY" ]; then
+      curl -sS -m 10 -X POST \
+        -H "apikey: \$SUPABASE_ANON_KEY" \
+        -H "Authorization: Bearer \$SUPABASE_ANON_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{\"p_secret\":\"\$SECRET_VAL\",\"p_url\":\"\$current\"}" \
+        "\$SUPABASE_URL_PUBLIC/rest/v1/rpc/register_runner_url" > /dev/null
+      echo "[watcher] re-registered: \$current"
+    fi
+  fi
+  heartbeat=\$((heartbeat + 1))
+  if [ \$heartbeat -ge 30 ] && [ -n "\$last_url" ]; then
+    # Heartbeat every ~5 min (30 * 10s) to refresh runner_last_seen
+    if [ -n "\$SUPABASE_URL_PUBLIC" ] && [ -n "\$SUPABASE_ANON_KEY" ]; then
+      curl -sS -m 10 -X POST \
+        -H "apikey: \$SUPABASE_ANON_KEY" \
+        -H "Authorization: Bearer \$SUPABASE_ANON_KEY" \
+        -H "Content-Type: application/json" \
+        -d "{\"p_secret\":\"\$SECRET_VAL\",\"p_url\":\"\$last_url\"}" \
+        "\$SUPABASE_URL_PUBLIC/rest/v1/rpc/register_runner_url" > /dev/null
+    fi
+    heartbeat=0
+  fi
+  sleep 10
+done
+WATCHER_EOF
+chmod +x "$WATCHER_SCRIPT"
+
+if command -v pm2 > /dev/null 2>&1; then
+  pm2 delete xylofra-watcher > /dev/null 2>&1 || true
+  pm2 start "$WATCHER_SCRIPT" \
+    --name xylofra-watcher --time --interpreter bash \
+    --restart-delay 5000 \
+    > /tmp/pm2-watcher.log 2>&1 \
+    && diag "watcher started under pm2" \
+    || diag "pm2 watcher start FAILED ($(tail -n 3 /tmp/pm2-watcher.log | tr '\n' '|'))"
+  pm2 save --force > /dev/null 2>&1 || true
 fi
 
 diag "postStart complete."
