@@ -1,0 +1,50 @@
+# Keep the codespace alive across the 240-min idle timeout.
+# Triggers every 4 hours (so it always stays under the 4-hour idle ceiling)
+# and on demand. Uses the GitHub Codespaces "start" API which counts as user
+# activity and resets the idle clock.
+#
+# Setup (one-time):
+#   1. Create a fine-grained PAT with scope: User > Codespaces > Read & Write
+#   2. Add it as repo secret:  GH_KEEPALIVE_PAT
+#   3. Add the codespace name as repo variable:  CODESPACE_NAME
+#      (e.g. "congenial-carnival-4jprw9vjxgppf7qqq")
+#
+# Note: keeping a codespace alive 24/7 still consumes monthly Codespace
+# core-hours. Personal accounts get 120 h/mo free; basicLinux32gb at 2 cores
+# uses ~240 core-hours per 24h. You will exceed the free quota in ~12 days.
+# For true always-on, host the runner on a small VPS (Oracle Cloud Free
+# Tier, Hetzner CX11, fly.io free tier, etc.) instead of a Codespace.
+
+name: keepalive
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake codespace if shut down
+        env:
+          GH_TOKEN: ${{ secrets.GH_KEEPALIVE_PAT }}
+          CS_NAME: ${{ vars.CODESPACE_NAME }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "Repo secret GH_KEEPALIVE_PAT not set; aborting."
+            exit 1
+          fi
+          if [ -z "$CS_NAME" ]; then
+            echo "Repo variable CODESPACE_NAME not set; aborting."
+            exit 1
+          fi
+          echo "Starting codespace $CS_NAME ..."
+          curl -fsS -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/user/codespaces/$CS_NAME/start" \
+          | head -c 600
+          echo
