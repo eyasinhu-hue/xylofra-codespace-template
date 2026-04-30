@@ -28,12 +28,23 @@ if [ -f runner.env ]; then
 fi
 
 : "${RUNNER_SECRET:?RUNNER_SECRET codespace secret missing}"
-: "${SUPABASE_URL_PUBLIC:?SUPABASE_URL_PUBLIC codespace secret missing}"
 : "${SUPABASE_ANON_KEY:?SUPABASE_ANON_KEY codespace secret missing}"
 
-# Strip /rest/v1 suffix the user may have added
-SUPABASE_URL_PUBLIC="${SUPABASE_URL_PUBLIC%/rest/v1}"
-SUPABASE_URL_PUBLIC="${SUPABASE_URL_PUBLIC%/}"
+# Bulletproof Supabase URL derivation. We accept any of:
+#   - XYLOFRA_PROJECT_REF (e.g. "qlfhxlicrdnlqmvdfsnm")  ← preferred
+#   - SUPABASE_URL_PUBLIC (any value; we strip the path)
+# and produce a clean "https://<ref>.supabase.co" with no trailing slash
+# or path component.
+if [ -n "${XYLOFRA_PROJECT_REF:-}" ]; then
+  SUPABASE_URL_PUBLIC="https://${XYLOFRA_PROJECT_REF}.supabase.co"
+elif [ -n "${SUPABASE_URL_PUBLIC:-}" ]; then
+  # Keep only "scheme://host", drop ANY path the user may have included
+  SUPABASE_URL_PUBLIC="$(echo "$SUPABASE_URL_PUBLIC" | grep -oE '^https?://[^/]+' || echo "$SUPABASE_URL_PUBLIC")"
+else
+  echo "ERROR: Need either XYLOFRA_PROJECT_REF or SUPABASE_URL_PUBLIC codespace secret" >&2
+  exit 1
+fi
+echo "[$(date -Iseconds)] using Supabase URL: ${SUPABASE_URL_PUBLIC}"
 
 PORT=3939
 echo "$RUNNER_SECRET" > /tmp/xylofra-runner.secret
