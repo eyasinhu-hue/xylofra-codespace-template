@@ -1,24 +1,17 @@
-# Keep the codespace alive across the 240-min idle timeout.
-# Triggers every 4 hours (so it always stays under the 4-hour idle ceiling)
-# and on demand. Uses the GitHub Codespaces "start" API which counts as user
-# activity and resets the idle clock.
+# Keeps the GitHub Codespace alive by pinging it every 20 minutes.
+# This prevents the idle timeout from shutting down the runner.
 #
-# Setup (one-time):
-#   1. Create a fine-grained PAT with scope: User > Codespaces > Read & Write
-#   2. Add it as repo secret:  GH_KEEPALIVE_PAT
-#   3. Add the codespace name as repo variable:  CODESPACE_NAME
-#      (e.g. "congenial-carnival-4jprw9vjxgppf7qqq")
+# Required repo secrets:  GH_KEEPALIVE_PAT  (PAT with codespace scope)
+# Required repo variables: CODESPACE_NAME   (e.g. "congenial-carnival-4jprw9vjxgppf7qqq")
 #
-# Note: keeping a codespace alive 24/7 still consumes monthly Codespace
-# core-hours. Personal accounts get 120 h/mo free; basicLinux32gb at 2 cores
-# uses ~240 core-hours per 24h. You will exceed the free quota in ~12 days.
-# For true always-on, host the runner on a small VPS (Oracle Cloud Free
-# Tier, Hetzner CX11, fly.io free tier, etc.) instead of a Codespace.
+# Both are already configured. No manual setup needed.
 
 name: keepalive
+
 on:
   schedule:
-    - cron: "0 */4 * * *"
+    # Every 20 minutes - prevents 240-min idle timeout
+    - cron: "*/20 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -28,23 +21,32 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Wake codespace if shut down
+      - name: Start codespace if shutdown
         env:
           GH_TOKEN: ${{ secrets.GH_KEEPALIVE_PAT }}
           CS_NAME: ${{ vars.CODESPACE_NAME }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
-            echo "Repo secret GH_KEEPALIVE_PAT not set; aborting."
+            echo "ERROR: GH_KEEPALIVE_PAT secret not set"
             exit 1
           fi
           if [ -z "$CS_NAME" ]; then
-            echo "Repo variable CODESPACE_NAME not set; aborting."
+            echo "ERROR: CODESPACE_NAME variable not set"
             exit 1
           fi
-          echo "Starting codespace $CS_NAME ..."
-          curl -fsS -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/user/codespaces/$CS_NAME/start" \
-          | head -c 600
-          echo
+          
+          # Check current state
+          STATE=$(curl -fsS             -H "Authorization: Bearer $GH_TOKEN"             -H "X-GitHub-Api-Version: 2022-11-28"             "https://api.github.com/user/codespaces/$CS_NAME" |             grep -o '"state":"[^"]*"' | head -1 | cut -d'"' -f4)
+          
+          echo "Codespace '$CS_NAME' current state: $STATE"
+          
+          if [ "$STATE" = "Shutdown" ] || [ "$STATE" = "ShuttingDown" ] || [ "$STATE" = "Unavailable" ]; then
+            echo "Starting codespace..."
+            curl -fsS -X POST               -H "Authorization: Bearer $GH_TOKEN"               -H "X-GitHub-Api-Version: 2022-11-28"               "https://api.github.com/user/codespaces/$CS_NAME/start"
+            echo "Start request sent successfully."
+          elif [ "$STATE" = "Available" ]; then
+            echo "Codespace is already running. No action needed."
+          else
+            echo "Codespace state '$STATE' - attempting start anyway..."
+            curl -s -X POST               -H "Authorization: Bearer $GH_TOKEN"               -H "X-GitHub-Api-Version: 2022-11-28"               "https://api.github.com/user/codespaces/$CS_NAME/start" || true
+          fi
