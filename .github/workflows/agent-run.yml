@@ -1,33 +1,15 @@
-# On-demand Agent Command Runner
-#
-# This workflow wakes up a GitHub-hosted runner ONLY when triggered.
-# When idle: costs nothing. When triggered: runs in ~30 seconds.
-#
-# HOW TO TRIGGER (via API):
-#   curl -X POST \
-#     -H "Authorization: token YOUR_PAT" \
-#     -H "Accept: application/vnd.github.v3+json" \
-#     https://api.github.com/repos/eyasinhu-hue/xylofra-codespace-template/dispatches \
-#     -d '{"event_type":"run-command","client_payload":{"command":"echo hello world"}}'
-#
-# HOW TO TRIGGER (manual): Go to Actions tab → Agent Command Runner → Run workflow
-
 name: Agent Command Runner
 
 on:
-  # Triggered via API call - main trigger for agents
   repository_dispatch:
     types: [run-command, agent-command, execute]
-
-  # Triggered manually from GitHub Actions UI
   workflow_dispatch:
     inputs:
       command:
-        description: 'Command to run (e.g. npm test, echo hello)'
+        description: 'Command to run'
         required: true
         default: 'echo "Agent is working!"'
       working_directory:
-        description: 'Working directory (optional)'
         required: false
         default: '.'
 
@@ -43,38 +25,99 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show runner info
+      - name: Set command variables
+        id: vars
         run: |
-          echo "Runner: $(hostname)"
-          echo "OS: $(uname -a)"
-          echo "Time: $(date)"
-          echo "Triggered by: ${{ github.event_name }}"
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "COMMAND=${{ github.event.client_payload.command }}" >> $GITHUB_ENV
+            echo "WORK_DIR=${{ github.event.client_payload.working_directory || '.' }}" >> $GITHUB_ENV
+            echo "TRIGGERED_BY=${{ github.event.client_payload.triggered_by || 'api' }}" >> $GITHUB_ENV
+            echo "LOG_ID=${{ github.event.client_payload.log_id || '' }}" >> $GITHUB_ENV
+          else
+            echo "COMMAND=${{ inputs.command }}" >> $GITHUB_ENV
+            echo "WORK_DIR=${{ inputs.working_directory || '.' }}" >> $GITHUB_ENV
+            echo "TRIGGERED_BY=manual" >> $GITHUB_ENV
+            echo "LOG_ID=" >> $GITHUB_ENV
+          fi
 
-      - name: Run command (repository_dispatch)
-        if: github.event_name == 'repository_dispatch'
+      - name: Log start to Supabase
         env:
-          COMMAND: ${{ github.event.client_payload.command }}
-          WORK_DIR: ${{ github.event.client_payload.working_directory || '.' }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          echo "=== Running command from API trigger ==="
-          echo "Command: $COMMAND"
-          echo "Directory: $WORK_DIR"
-          echo "========================================"
-          cd "$WORK_DIR"
-          eval "$COMMAND"
+          START_TIME=$(date +%s%3N)
+          echo "START_TIME=$START_TIME" >> $GITHUB_ENV
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "RUN_URL=$RUN_URL" >> $GITHUB_ENV
 
-      - name: Run command (workflow_dispatch)
-        if: github.event_name == 'workflow_dispatch'
+          if [ -n "$LOG_ID" ] && [ -n "$SUPABASE_URL" ]; then
+            curl -s -X PATCH \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/json" \
+              "$SUPABASE_URL/rest/v1/command_logs?id=eq.$LOG_ID" \
+              -d "{\"status\":\"running\",\"run_url\":\"$RUN_URL\"}" || true
+            echo "Updated log entry $LOG_ID to running"
+          else
+            # Insert new log entry if no log_id
+            RESULT=$(curl -s -X POST \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/json" \
+              -H "Prefer: return=representation" \
+              "$SUPABASE_URL/rest/v1/command_logs" \
+              -d "{\"command\":\"$COMMAND\",\"triggered_by\":\"$TRIGGERED_BY\",\"status\":\"running\",\"run_url\":\"$RUN_URL\"}")
+            echo "Created log: $RESULT" | head -c 200
+          fi
+
+      - name: Run command
+        id: run_cmd
+        run: |
+          cd "$WORK_DIR" 2>/dev/null || true
+          echo "=== Command: $COMMAND ==="
+          echo "=== Started: $(date) ==="
+          echo "---"
+          set +e
+          OUTPUT=$(eval "$COMMAND" 2>&1)
+          EXIT_CODE=$?
+          set -e
+          echo "$OUTPUT"
+          echo "---"
+          echo "=== Exit code: $EXIT_CODE ==="
+          # Save to files for next step
+          echo "$OUTPUT" > /tmp/cmd_output.txt
+          echo "$EXIT_CODE" > /tmp/cmd_exit.txt
+
+      - name: Log result to Supabase
+        if: always()
         env:
-          COMMAND: ${{ inputs.command }}
-          WORK_DIR: ${{ inputs.working_directory }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
-          echo "=== Running command from manual trigger ==="
-          echo "Command: $COMMAND"
-          echo "Directory: $WORK_DIR"
-          echo "=========================================="
-          cd "$WORK_DIR"
-          eval "$COMMAND"
+          END_TIME=$(date +%s%3N)
+          DURATION=$(( END_TIME - START_TIME ))
+          EXIT_CODE=$(cat /tmp/cmd_exit.txt 2>/dev/null || echo "1")
+          OUTPUT=$(cat /tmp/cmd_output.txt 2>/dev/null | head -c 10000)
+          STATUS=$([ "$EXIT_CODE" = "0" ] && echo "success" || echo "failed")
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-      - name: Done
-        run: echo "Command completed at $(date)"
+          # Escape output for JSON
+          OUTPUT_ESCAPED=$(echo "$OUTPUT" | node -e "let d=''; process.stdin.on('data', c=>d+=c); process.stdin.on('end', ()=>console.log(JSON.stringify(d)))")
+
+          if [ -n "$LOG_ID" ] && [ -n "$SUPABASE_URL" ]; then
+            curl -s -X PATCH \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/json" \
+              "$SUPABASE_URL/rest/v1/command_logs?id=eq.$LOG_ID" \
+              -d "{\"status\":\"$STATUS\",\"exit_code\":$EXIT_CODE,\"stdout\":$OUTPUT_ESCAPED,\"duration_ms\":$DURATION,\"completed_at\":\"$NOW\"}" || true
+          else
+            # Update latest running entry
+            curl -s -X PATCH \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              -H "apikey: $SUPABASE_SERVICE_KEY" \
+              -H "Content-Type: application/json" \
+              "$SUPABASE_URL/rest/v1/command_logs?run_url=eq.$RUN_URL" \
+              -d "{\"status\":\"$STATUS\",\"exit_code\":$EXIT_CODE,\"stdout\":$OUTPUT_ESCAPED,\"duration_ms\":$DURATION,\"completed_at\":\"$NOW\"}" || true
+          fi
+          echo "Logged to Supabase: status=$STATUS exit=$EXIT_CODE duration=${DURATION}ms"
