@@ -1,0 +1,80 @@
+# On-demand Agent Command Runner
+#
+# This workflow wakes up a GitHub-hosted runner ONLY when triggered.
+# When idle: costs nothing. When triggered: runs in ~30 seconds.
+#
+# HOW TO TRIGGER (via API):
+#   curl -X POST \
+#     -H "Authorization: token YOUR_PAT" \
+#     -H "Accept: application/vnd.github.v3+json" \
+#     https://api.github.com/repos/eyasinhu-hue/xylofra-codespace-template/dispatches \
+#     -d '{"event_type":"run-command","client_payload":{"command":"echo hello world"}}'
+#
+# HOW TO TRIGGER (manual): Go to Actions tab → Agent Command Runner → Run workflow
+
+name: Agent Command Runner
+
+on:
+  # Triggered via API call - main trigger for agents
+  repository_dispatch:
+    types: [run-command, agent-command, execute]
+
+  # Triggered manually from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      command:
+        description: 'Command to run (e.g. npm test, echo hello)'
+        required: true
+        default: 'echo "Agent is working!"'
+      working_directory:
+        description: 'Working directory (optional)'
+        required: false
+        default: '.'
+
+permissions:
+  contents: read
+
+jobs:
+  run-agent-command:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show runner info
+        run: |
+          echo "Runner: $(hostname)"
+          echo "OS: $(uname -a)"
+          echo "Time: $(date)"
+          echo "Triggered by: ${{ github.event_name }}"
+
+      - name: Run command (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        env:
+          COMMAND: ${{ github.event.client_payload.command }}
+          WORK_DIR: ${{ github.event.client_payload.working_directory || '.' }}
+        run: |
+          echo "=== Running command from API trigger ==="
+          echo "Command: $COMMAND"
+          echo "Directory: $WORK_DIR"
+          echo "========================================"
+          cd "$WORK_DIR"
+          eval "$COMMAND"
+
+      - name: Run command (workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          COMMAND: ${{ inputs.command }}
+          WORK_DIR: ${{ inputs.working_directory }}
+        run: |
+          echo "=== Running command from manual trigger ==="
+          echo "Command: $COMMAND"
+          echo "Directory: $WORK_DIR"
+          echo "=========================================="
+          cd "$WORK_DIR"
+          eval "$COMMAND"
+
+      - name: Done
+        run: echo "Command completed at $(date)"
