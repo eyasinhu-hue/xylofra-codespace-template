@@ -1,52 +1,15 @@
-# Keeps the GitHub Codespace alive by pinging it every 20 minutes.
-# This prevents the idle timeout from shutting down the runner.
-#
-# Required repo secrets:  GH_KEEPALIVE_PAT  (PAT with codespace scope)
-# Required repo variables: CODESPACE_NAME   (e.g. "congenial-carnival-4jprw9vjxgppf7qqq")
-#
-# Both are already configured. No manual setup needed.
+# Keepalive disabled - not needed for on-demand GitHub-hosted runners
+# Use agent-run.yml for on-demand command execution
+# This file kept for reference only
 
-name: keepalive
+name: keepalive-disabled
 
 on:
-  schedule:
-    # Every 20 minutes - prevents 240-min idle timeout
-    - cron: "*/20 * * * *"
   workflow_dispatch: {}
 
-permissions:
-  contents: read
-
 jobs:
-  ping:
+  info:
     runs-on: ubuntu-latest
     steps:
-      - name: Start codespace if shutdown
-        env:
-          GH_TOKEN: ${{ secrets.GH_KEEPALIVE_PAT }}
-          CS_NAME: ${{ vars.CODESPACE_NAME }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "ERROR: GH_KEEPALIVE_PAT secret not set"
-            exit 1
-          fi
-          if [ -z "$CS_NAME" ]; then
-            echo "ERROR: CODESPACE_NAME variable not set"
-            exit 1
-          fi
-          
-          # Check current state
-          STATE=$(curl -fsS             -H "Authorization: Bearer $GH_TOKEN"             -H "X-GitHub-Api-Version: 2022-11-28"             "https://api.github.com/user/codespaces/$CS_NAME" |             grep -o '"state":"[^"]*"' | head -1 | cut -d'"' -f4)
-          
-          echo "Codespace '$CS_NAME' current state: $STATE"
-          
-          if [ "$STATE" = "Shutdown" ] || [ "$STATE" = "ShuttingDown" ] || [ "$STATE" = "Unavailable" ]; then
-            echo "Starting codespace..."
-            curl -fsS -X POST               -H "Authorization: Bearer $GH_TOKEN"               -H "X-GitHub-Api-Version: 2022-11-28"               "https://api.github.com/user/codespaces/$CS_NAME/start"
-            echo "Start request sent successfully."
-          elif [ "$STATE" = "Available" ]; then
-            echo "Codespace is already running. No action needed."
-          else
-            echo "Codespace state '$STATE' - attempting start anyway..."
-            curl -s -X POST               -H "Authorization: Bearer $GH_TOKEN"               -H "X-GitHub-Api-Version: 2022-11-28"               "https://api.github.com/user/codespaces/$CS_NAME/start" || true
-          fi
+      - name: Info
+        run: echo "Use agent-run.yml workflow for on-demand execution"
